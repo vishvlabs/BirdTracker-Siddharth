@@ -61,6 +61,7 @@ OpenCV is loaded from the bundled AAR via `OpenCVLoader.initLocal()` — no Open
 | Stabilized | Stabilization | Current frame warped to align with previous |
 | Diff-B | Stabilization | Amplified pixel difference before stabilization |
 | Diff-A | Stabilization | Amplified pixel difference after stabilization |
+| Foreground Mask | GMM | White = foreground, gray = shadow, black = learned background |
 
 **FAST Features** are corners and textured image locations. They are expected to appear on stationary background objects. They are not a motion detector.
 
@@ -98,4 +99,4 @@ Each source (`CAMERA_REAR`, `CAMERA_FRONT`, `VIDEO`) maintains independent per-s
 | M3 | Shared `AnalysisFrame` pipeline, frame extraction | Done |
 | M4 | OpenCV FAST feature detection, display modes, diagnostic stats | Done |
 | M5 | Feature correspondence, partial affine stabilization, diff modes | Done |
-| M6 | Background subtraction / motion detection | Planned |
+| M6 | GMM background subtraction, foreground mask | Done |

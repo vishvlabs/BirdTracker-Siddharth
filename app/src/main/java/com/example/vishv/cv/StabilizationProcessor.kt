@@ -208,7 +208,7 @@ class StabilizationProcessor {
                 frame, prevState, featureProcessingTimeMs, matchingTimeMs, 0L, 0L,
                 finalKps.size, descriptors.rows(), allMatches.size, filteredMatches.size,
                 0, 0f, StabilizationFailureReason.TOO_FEW_MATCHES,
-                0f, 0f, 0f, 1f, null, null, null, null, null, null, totalStart,
+                0f, 0f, 0f, 1f, null, null, null, null, null, totalStart,
             )
         }
 
@@ -249,7 +249,7 @@ class StabilizationProcessor {
                 transformEstimationTimeMs, 0L,
                 finalKps.size, descriptors.rows(), allMatches.size, filteredMatches.size,
                 0, 0f, StabilizationFailureReason.ESTIMATOR_FAILED,
-                0f, 0f, 0f, 1f, null, null, null, null, debugBmp, null, totalStart,
+                0f, 0f, 0f, 1f, null, null, null, debugBmp, null, totalStart,
             )
         }
 
@@ -316,11 +316,15 @@ class StabilizationProcessor {
         val warpTimeMs = SystemClock.elapsedRealtime() - warpStart
 
         // ── 11. Debug bitmap ──────────────────────────────────────────────────────────────────────
+        // Always produce the stabilized bitmap so the downstream GMM stage can consume it
+        // without re-running warpAffine. When the display mode is STABILIZED, reuse this
+        // bitmap for the overlay rather than creating a second copy.
+        val stabilizedBmp: Bitmap? = stabilizedRgba?.let { matToRgbaBitmap(it) }
+
         val debugBmp: Bitmap? = when (displayMode) {
             DisplayMode.FEATURE_MATCHES ->
                 buildMatchBitmap(prevState, rgbaMat, finalKps, filteredMatches, inliersMask)
-            DisplayMode.STABILIZED ->
-                stabilizedRgba?.let { matToRgbaBitmap(it) }
+            DisplayMode.STABILIZED -> stabilizedBmp
             DisplayMode.DIFF_BEFORE ->
                 diffBefore?.let { grayDiffToBitmap(it) }
             DisplayMode.DIFF_AFTER ->
@@ -348,7 +352,7 @@ class StabilizationProcessor {
             finalKps.size, descriptors.rows(), allMatches.size, filteredMatches.size,
             inlierCount, inlierRatio, failureReason,
             tx, ty, rotDeg, scale, madBefore, madAfter, diffReductionPct, debugBmp,
-            null, null, totalStart,
+            stabilizedBmp, totalStart,
         )
     }
 
@@ -448,6 +452,7 @@ class StabilizationProcessor {
         totalStabilizationTimeMs = SystemClock.elapsedRealtime() - totalStart,
         meanAbsDiffBefore = null, meanAbsDiffAfter = null, diffReductionPct = null,
         debugBitmap = null,
+        stabilizedBitmap = null,
     )
 
     @Suppress("LongParameterList")
@@ -468,8 +473,7 @@ class StabilizationProcessor {
         tx: Float, ty: Float, rotDeg: Float, scale: Float,
         madBefore: Float?, madAfter: Float?, diffReductionPct: Float?,
         debugBmp: Bitmap?,
-        @Suppress("UNUSED_PARAMETER") unused1: Bitmap?,
-        @Suppress("UNUSED_PARAMETER") unused2: Bitmap?,
+        stabilizedBitmap: Bitmap?,
         totalStart: Long,
     ) = StabilizationResult(
         source = frame.source,
@@ -489,6 +493,7 @@ class StabilizationProcessor {
         meanAbsDiffBefore = madBefore, meanAbsDiffAfter = madAfter,
         diffReductionPct = diffReductionPct,
         debugBitmap = debugBmp,
+        stabilizedBitmap = stabilizedBitmap,
     )
 
     // ── Internal state holder ─────────────────────────────────────────────────────────────────────

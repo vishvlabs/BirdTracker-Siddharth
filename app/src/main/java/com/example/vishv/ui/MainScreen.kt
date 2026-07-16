@@ -48,7 +48,10 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.vishv.model.FastSettings
 import com.example.vishv.model.FeatureDetectionResult
+import com.example.vishv.model.ForegroundDetectionResult
 import com.example.vishv.model.FrameSource
+import com.example.vishv.model.GmmModelStatus
+import com.example.vishv.model.GmmSettings
 import com.example.vishv.model.StabilizationFailureReason
 import com.example.vishv.model.StabilizationResult
 import com.example.vishv.model.StabilizationSettings
@@ -76,6 +79,8 @@ fun MainScreen(viewModel: MainViewModel) {
     val displayMode     by viewModel.displayMode.collectAsState()
     val latestDetection by viewModel.latestDetectionResult.collectAsState()
     val latestStabResult by viewModel.latestStabResult.collectAsState()
+    val latestFgResult  by viewModel.latestFgResult.collectAsState()
+    val gmmSettings     by viewModel.gmmSettings.collectAsState()
     val videoDiag       by viewModel.videoExtractionDiag.collectAsState()
 
     val hasCameraPermission = ContextCompat.checkSelfPermission(
@@ -95,6 +100,7 @@ fun MainScreen(viewModel: MainViewModel) {
         inputMode = inputMode,
         cameraRunning = cameraUiState.isRunning,
         videoUiState = videoUiState,
+        fgResult = latestFgResult,
     )
 
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -154,6 +160,7 @@ fun MainScreen(viewModel: MainViewModel) {
                     framesAnalyzed = analysisState.framesAnalyzed,
                     detection = latestDetection,
                     stabResult = latestStabResult,
+                    fgResult = latestFgResult,
                 )
 
                 HorizontalDivider()
@@ -162,14 +169,21 @@ fun MainScreen(viewModel: MainViewModel) {
                     analysisState = analysisState,
                     fastSettings = fastSettings,
                     stabSettings = stabSettings,
+                    gmmSettings = gmmSettings,
                     detection = latestDetection,
                     stabResult = latestStabResult,
+                    fgResult = latestFgResult,
                     videoDiag = videoDiag,
                     onThresholdChange = viewModel::setFastThreshold,
                     onNmsToggle = viewModel::toggleNonMaxSuppression,
                     onMaxPointsChange = viewModel::setMaxFeaturePoints,
                     onRansacThresholdChange = viewModel::setRansacThreshold,
                     onMinInlierRatioChange = viewModel::setMinInlierRatio,
+                    onGmmHistoryChange = viewModel::setGmmHistory,
+                    onGmmVarThresholdChange = viewModel::setGmmVarThreshold,
+                    onGmmLearningRateChange = viewModel::setGmmLearningRate,
+                    onGmmShadowToggle = viewModel::toggleGmmShadowDetection,
+                    onGmmWarmUpFramesChange = viewModel::setGmmWarmUpFrames,
                 )
             }
         }
@@ -184,14 +198,18 @@ private fun deriveStatus(
     inputMode: InputMode,
     cameraRunning: Boolean,
     videoUiState: VideoUiState,
+    fgResult: ForegroundDetectionResult?,
 ): String = when {
     !opencvReady -> "OpenCV Failed"
     inputMode == InputMode.CAMERA && !hasCameraPermission -> "Camera Permission Required"
-    inputMode == InputMode.CAMERA -> if (cameraRunning) "Analyzing" else "Camera Stopped"
+    inputMode == InputMode.CAMERA && !cameraRunning -> "Camera Stopped"
+    inputMode == InputMode.CAMERA ->
+        if (fgResult?.modelStatus == GmmModelStatus.WARMING_UP) "Learning Background" else "Analyzing"
     videoUiState.uri == null -> "No Video Selected"
     !videoUiState.isPrepared -> "Loading..."
-    videoUiState.isPlaying -> "Analyzing"
-    else -> "Paused"
+    !videoUiState.isPlaying -> "Paused"
+    fgResult?.modelStatus == GmmModelStatus.WARMING_UP -> "Learning Background"
+    else -> "Analyzing"
 }
 
 @Composable
@@ -203,7 +221,7 @@ private fun StatusStrip(
     analysisRateFps: Int,
     sessionElapsedSec: Long,
 ) {
-    val isAnalyzing = status == "Analyzing"
+    val isAnalyzing = status == "Analyzing" || status == "Learning Background"
     val isError = status == "OpenCV Failed" || status == "Camera Permission Required"
 
     val statusColor = when {
@@ -294,6 +312,10 @@ private val MODE_INFO = mapOf(
         chipLabel = "Difference (Stabilized)",
         explanation = "Pixel changes between frames after stabilization. Camera shake has been removed — bright areas represent scene changes only.",
     ),
+    DisplayMode.FOREGROUND_MASK to ModeInfo(
+        chipLabel = "Foreground Mask",
+        explanation = "GMM background model output. White = foreground (moving or novel objects), gray = shadow (if shadow detection is on), black = learned background.",
+    ),
 )
 
 @Composable
@@ -366,9 +388,29 @@ private fun ObservedEntitiesPanel(
     framesAnalyzed: Long,
     detection: FeatureDetectionResult?,
     stabResult: StabilizationResult?,
+    fgResult: ForegroundDetectionResult?,
 ) {
     val stabLabel = stabResult?.let { stabStatusLabel(it.failureReason) }
     val stabColor: Color? = stabResult?.let { stabStatusColor(it.failureReason) }
+
+    val fgPixelValue = when {
+        fgResult == null -> "–"
+        fgResult.modelStatus == GmmModelStatus.WARMING_UP -> "Learning..."
+        !fgResult.gmmApplied -> "–"
+        else -> "${fgResult.foregroundPixelCount} (${"%.1f".format(fgResult.foregroundPct)}%)"
+    }
+
+    val bgModelValue = when {
+        fgResult == null -> "–"
+        fgResult.modelStatus == GmmModelStatus.WARMING_UP ->
+            "${fgResult.warmUpFramesCompleted} / ${fgResult.warmUpFramesRequired}"
+        else -> "Active"
+    }
+    val bgModelColor: Color? = when {
+        fgResult == null -> null
+        fgResult.modelStatus == GmmModelStatus.ACTIVE -> MaterialTheme.colorScheme.primary
+        else -> null
+    }
 
     Column(
         modifier = Modifier
@@ -389,6 +431,10 @@ private fun ObservedEntitiesPanel(
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             EntityTile("Reliable Matches", stabResult?.inlierCount?.toString() ?: "–", modifier = Modifier.weight(1f))
             EntityTile("Stabilization", stabLabel ?: "–", valueColor = stabColor, modifier = Modifier.weight(1f))
+        }
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            EntityTile("Foreground Pixels", fgPixelValue, modifier = Modifier.weight(1f))
+            EntityTile("Background Model", bgModelValue, valueColor = bgModelColor, modifier = Modifier.weight(1f))
         }
     }
 }
@@ -449,14 +495,21 @@ private fun AdvancedDebugSection(
     analysisState: AnalysisState,
     fastSettings: FastSettings,
     stabSettings: StabilizationSettings,
+    gmmSettings: GmmSettings,
     detection: FeatureDetectionResult?,
     stabResult: StabilizationResult?,
+    fgResult: ForegroundDetectionResult?,
     videoDiag: VideoExtractionDiag?,
     onThresholdChange: (Int) -> Unit,
     onNmsToggle: () -> Unit,
     onMaxPointsChange: (Int) -> Unit,
     onRansacThresholdChange: (Double) -> Unit,
     onMinInlierRatioChange: (Float) -> Unit,
+    onGmmHistoryChange: (Int) -> Unit,
+    onGmmVarThresholdChange: (Double) -> Unit,
+    onGmmLearningRateChange: (Double) -> Unit,
+    onGmmShadowToggle: () -> Unit,
+    onGmmWarmUpFramesChange: (Int) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
 
@@ -551,6 +604,53 @@ private fun AdvancedDebugSection(
                 }
             }
 
+            // ── GMM controls ───────────────────────────────────────────────────
+            DebugGroup("Background Subtraction (GMM)") {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("History: ${gmmSettings.history}", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(110.dp))
+                    Slider(
+                        value = gmmSettings.history.toFloat(),
+                        onValueChange = { onGmmHistoryChange(it.roundToInt()) },
+                        valueRange = 50f..500f,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Var Threshold: ${"%.1f".format(gmmSettings.varThreshold)}", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(110.dp))
+                    Slider(
+                        value = gmmSettings.varThreshold.toFloat(),
+                        onValueChange = { onGmmVarThresholdChange(it.toDouble()) },
+                        valueRange = 4f..64f,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    val lrLabel = if (gmmSettings.learningRate == 0.0) "Learn Rate: Auto"
+                                  else "Learn Rate: ${"%.3f".format(gmmSettings.learningRate)}"
+                    Text(lrLabel, style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(110.dp))
+                    Slider(
+                        value = gmmSettings.learningRate.toFloat(),
+                        onValueChange = { onGmmLearningRateChange(it.toDouble()) },
+                        valueRange = 0f..0.5f,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Detect Shadows", style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f))
+                    Switch(checked = gmmSettings.detectShadows, onCheckedChange = { onGmmShadowToggle() })
+                }
+                Text("Warm-up Frames", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(10, 20, 30, 50).forEach { n ->
+                        if (n == gmmSettings.warmUpFrames) {
+                            Button(onClick = {}, modifier = Modifier.weight(1f)) { Text("$n", style = MaterialTheme.typography.labelSmall) }
+                        } else {
+                            OutlinedButton(onClick = { onGmmWarmUpFramesChange(n) }, modifier = Modifier.weight(1f)) { Text("$n", style = MaterialTheme.typography.labelSmall) }
+                        }
+                    }
+                }
+            }
+
             // ── Feature detection stats ────────────────────────────────────────
             if (detection != null) {
                 DebugGroup("Feature Detection Stats") {
@@ -585,6 +685,27 @@ private fun AdvancedDebugSection(
                     stabResult.meanAbsDiffBefore?.let  { DebugRow("MAD Before",      "${"%.1f".format(it)}") }
                     stabResult.meanAbsDiffAfter?.let   { DebugRow("MAD After",       "${"%.1f".format(it)}") }
                     stabResult.diffReductionPct?.let   { DebugRow("Diff Reduction",  "${"%.1f".format(it)}%") }
+                }
+            }
+
+            // ── GMM stats ──────────────────────────────────────────────────────
+            if (fgResult != null) {
+                DebugGroup("GMM Stats") {
+                    DebugRow("Model Status",  fgResult.modelStatus.name)
+                    DebugRow("Warm-up",       "${fgResult.warmUpFramesCompleted} / ${fgResult.warmUpFramesRequired}")
+                    DebugRow("GMM Applied",   if (fgResult.gmmApplied) "Yes" else "No")
+                    if (!fgResult.gmmApplied) {
+                        DebugRow("Skip Reason", fgResult.skipReason.name)
+                        fgResult.stabFailureReason?.let { DebugRow("Stab Failure", it.name) }
+                    }
+                    if (fgResult.gmmApplied && fgResult.modelStatus == GmmModelStatus.ACTIVE) {
+                        DebugRow("FG Pixels",  "${fgResult.foregroundPixelCount} (${"%.1f".format(fgResult.foregroundPct)}%)")
+                        if (fgResult.shadowDetectionEnabled) {
+                            DebugRow("Shadow Pixels", "${fgResult.shadowPixelCount} (${"%.1f".format(fgResult.shadowPct)}%)")
+                        }
+                        DebugRow("Total Pixels", "${fgResult.totalPixelCount}")
+                    }
+                    DebugRow("GMM Time", "${fgResult.gmmProcessingTimeMs} ms")
                 }
             }
 

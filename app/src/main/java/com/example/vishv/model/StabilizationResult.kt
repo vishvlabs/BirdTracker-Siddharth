@@ -22,9 +22,9 @@ enum class StabilizationFailureReason {
  * Result of one stabilization pass. Contains no OpenCV-native types — safe to post to StateFlow
  * and observe from Compose.
  *
- * Bitmap ownership: debugBitmap is created by StabilizationProcessor and transferred here.
- * It is NOT recycled explicitly; it goes out of scope naturally when the StateFlow value is
- * replaced and Compose finishes rendering the previous frame.
+ * Bitmap ownership: debugBitmap and stabilizedBitmap are created by StabilizationProcessor and
+ * transferred here. They are not recycled explicitly; GC reclaims them when the StateFlow value
+ * is replaced and Compose finishes rendering the previous frame.
  */
 data class StabilizationResult(
     val source: FrameSource,
@@ -56,4 +56,7 @@ data class StabilizationResult(
     val diffReductionPct: Float?,
     // --- Debug bitmap (mode-dependent, may be null) ---
     val debugBitmap: Bitmap?,
+    // --- Stabilized frame bitmap (always set when transformSuccess == true) ---
+    // Consumed by GmmForegroundProcessor to keep the background model camera-shake-free.
+    val stabilizedBitmap: Bitmap?,
 )

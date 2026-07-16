@@ -58,6 +58,7 @@ fun CameraScreen(viewModel: MainViewModel) {
     val displayMode by viewModel.displayMode.collectAsState()
     val latestDetection by viewModel.latestDetectionResult.collectAsState()
     val latestStabResult by viewModel.latestStabResult.collectAsState()
+    val latestFgResult by viewModel.latestFgResult.collectAsState()
     val analysisState by viewModel.analysisState.collectAsState()
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -207,6 +208,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                     DisplayMode.GRAYSCALE, DisplayMode.FAST_FEATURES -> latestDetection?.debugBitmap
                     DisplayMode.FEATURE_MATCHES, DisplayMode.STABILIZED,
                     DisplayMode.DIFF_BEFORE, DisplayMode.DIFF_AFTER -> latestStabResult?.debugBitmap
+                    DisplayMode.FOREGROUND_MASK -> latestFgResult?.maskBitmap
                     else -> null
                 }
                 // rotationDegrees is the CW rotation needed to make the raw sensor buffer upright

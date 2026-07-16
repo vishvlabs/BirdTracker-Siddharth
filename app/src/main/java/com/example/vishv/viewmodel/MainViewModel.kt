@@ -12,12 +12,16 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.example.vishv.cv.FastFeatureProcessor
+import com.example.vishv.cv.GmmForegroundProcessor
 import com.example.vishv.cv.StabilizationProcessor
 import com.example.vishv.model.AnalysisFrame
 import com.example.vishv.model.FastSettings
 import com.example.vishv.model.FeatureDetectionResult
+import com.example.vishv.model.ForegroundDetectionResult
 import com.example.vishv.model.FrameMetadata
 import com.example.vishv.model.FrameSource
+import com.example.vishv.model.GmmSettings
+import com.example.vishv.model.StabilizationFailureReason
 import com.example.vishv.model.StabilizationResult
 import com.example.vishv.model.StabilizationSettings
 import kotlinx.coroutines.Dispatchers
@@ -42,6 +46,7 @@ enum class DisplayMode {
     STABILIZED,
     DIFF_BEFORE,
     DIFF_AFTER,
+    FOREGROUND_MASK,
 }
 
 data class CameraUiState(
@@ -87,6 +92,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val opencvReady: Boolean = OpenCVLoader.initLocal()
     private val fastProcessor = FastFeatureProcessor()
     private val stabProcessor = StabilizationProcessor()
+    private val gmmProcessor = GmmForegroundProcessor()
 
     // --- Input mode ---
     private val _inputMode = MutableStateFlow(InputMode.CAMERA)
@@ -112,6 +118,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _stabSettings = MutableStateFlow(StabilizationSettings())
     val stabSettings: StateFlow<StabilizationSettings> = _stabSettings.asStateFlow()
 
+    // --- GMM settings ---
+    private val _gmmSettings = MutableStateFlow(GmmSettings())
+    val gmmSettings: StateFlow<GmmSettings> = _gmmSettings.asStateFlow()
+
     // --- Display mode (controls which debug bitmap is rendered) ---
     private val _displayMode = MutableStateFlow(DisplayMode.ORIGINAL)
     val displayMode: StateFlow<DisplayMode> = _displayMode.asStateFlow()
@@ -123,6 +133,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // --- Latest stabilization result ---
     private val _latestStabResult = MutableStateFlow<StabilizationResult?>(null)
     val latestStabResult: StateFlow<StabilizationResult?> = _latestStabResult.asStateFlow()
+
+    // --- Latest foreground detection result ---
+    private val _latestFgResult = MutableStateFlow<ForegroundDetectionResult?>(null)
+    val latestFgResult: StateFlow<ForegroundDetectionResult?> = _latestFgResult.asStateFlow()
 
     // --- Video frame extraction diagnostic ---
     private val _videoExtractionDiag = MutableStateFlow<VideoExtractionDiag?>(null)
@@ -181,6 +195,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         _inputMode.value = mode
         stabProcessor.resetAll()
+        gmmProcessor.resetAll()
         clearStaleResults()
     }
 
@@ -198,6 +213,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lastCameraFrameAnalyzedMs = 0L
         stabProcessor.resetSource(FrameSource.CAMERA_REAR)
         stabProcessor.resetSource(FrameSource.CAMERA_FRONT)
+        gmmProcessor.resetSource(FrameSource.CAMERA_REAR)
+        gmmProcessor.resetSource(FrameSource.CAMERA_FRONT)
         clearStaleResults()
     }
 
@@ -242,6 +259,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         releaseRetriever()
         _videoUiState.update { VideoUiState(uri = uri, fileName = fileName) }
         stabProcessor.resetSource(FrameSource.VIDEO)
+        gmmProcessor.resetSource(FrameSource.VIDEO)
         clearStaleResults()
         player.stop()
         player.clearMediaItems()
@@ -259,12 +277,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun restartVideo() {
         stabProcessor.resetSource(FrameSource.VIDEO)
+        gmmProcessor.resetSource(FrameSource.VIDEO)
         player.seekTo(0L)
         player.play()
     }
 
     fun stopVideo() {
         stabProcessor.resetSource(FrameSource.VIDEO)
+        gmmProcessor.resetSource(FrameSource.VIDEO)
         player.pause()
         player.seekTo(0L)
     }
@@ -302,6 +322,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setMinInlierRatio(ratio: Float) {
         _stabSettings.update { it.copy(minInlierRatio = ratio.coerceIn(0.05f, 0.95f)) }
+    }
+
+    // --- GMM settings ---
+
+    fun setGmmHistory(history: Int) {
+        val newSettings = _gmmSettings.value.copy(history = history.coerceIn(50, 500))
+        _gmmSettings.value = newSettings
+        gmmProcessor.updateSettings(newSettings)
+    }
+
+    fun setGmmVarThreshold(threshold: Double) {
+        val newSettings = _gmmSettings.value.copy(varThreshold = threshold.coerceIn(4.0, 64.0))
+        _gmmSettings.value = newSettings
+        gmmProcessor.updateSettings(newSettings)
+    }
+
+    fun setGmmLearningRate(rate: Double) {
+        val newSettings = _gmmSettings.value.copy(learningRate = rate.coerceIn(0.0, 0.5))
+        _gmmSettings.value = newSettings
+        gmmProcessor.updateSettings(newSettings)
+    }
+
+    fun toggleGmmShadowDetection() {
+        val newSettings = _gmmSettings.value.copy(detectShadows = !_gmmSettings.value.detectShadows)
+        _gmmSettings.value = newSettings
+        gmmProcessor.updateSettings(newSettings)
+    }
+
+    fun setGmmWarmUpFrames(frames: Int) {
+        val newSettings = _gmmSettings.value.copy(warmUpFrames = frames.coerceIn(5, 100))
+        _gmmSettings.value = newSettings
+        gmmProcessor.updateSettings(newSettings)
     }
 
     // --- Shared frame consumer ---
@@ -343,6 +395,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         } else null
 
+        // A timestamp gap means a video seek; reset the background model so the next frames
+        // start fresh rather than contaminating the model with a sudden scene change.
+        if (stabResult?.failureReason == StabilizationFailureReason.TIMESTAMP_GAP) {
+            gmmProcessor.resetSource(frame.source)
+        }
+
+        val fgResult: ForegroundDetectionResult? = if (opencvReady && stabResult != null) {
+            try {
+                gmmProcessor.process(frame.source, frame.timestampMs, stabResult, isDuplicate, mode)
+            } catch (e: Exception) {
+                null
+            }
+        } else null
+
         val processingTimeMs = SystemClock.elapsedRealtime() - receivedAtMs
 
         _analysisState.update { state ->
@@ -363,6 +429,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         if (fastResult != null) _latestDetectionResult.value = fastResult
         if (stabResult != null) _latestStabResult.value = stabResult
+        if (fgResult != null) _latestFgResult.value = fgResult
 
         frame.bitmap.recycle()
     }
@@ -387,6 +454,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         videoExtractionJob?.cancel()
         prevVideoFrameHash = Int.MIN_VALUE
         stabProcessor.resetSource(FrameSource.VIDEO)
+        gmmProcessor.resetSource(FrameSource.VIDEO)
         videoExtractionJob = viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
                 val startMs = SystemClock.elapsedRealtime()
@@ -480,6 +548,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun clearStaleResults() {
         _latestDetectionResult.value = null
         _latestStabResult.value = null
+        _latestFgResult.value = null
     }
 
     private fun releaseRetriever() {
