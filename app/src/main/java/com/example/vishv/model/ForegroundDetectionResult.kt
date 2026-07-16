@@ -41,6 +41,9 @@ data class ForegroundDetectionResult(
     val shadowDetectionEnabled: Boolean,
     // --- Timing ---
     val gmmProcessingTimeMs: Long,
-    // --- Debug bitmap (only populated when displayMode == FOREGROUND_MASK) ---
+    // --- Bitmaps ---
+    // maskBitmap: display only, non-null only when displayMode == FOREGROUND_MASK.
     val maskBitmap: Bitmap?,
+    // rawMaskBitmap: always non-null when gmmApplied == true; consumed by CandidateRegionExtractor.
+    val rawMaskBitmap: Bitmap?,
 )

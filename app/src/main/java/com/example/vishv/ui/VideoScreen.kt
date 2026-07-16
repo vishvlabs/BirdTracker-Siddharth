@@ -53,6 +53,7 @@ fun VideoScreen(viewModel: MainViewModel) {
     val latestDetection by viewModel.latestDetectionResult.collectAsState()
     val latestStabResult by viewModel.latestStabResult.collectAsState()
     val latestFgResult by viewModel.latestFgResult.collectAsState()
+    val latestCandidateResult by viewModel.latestCandidateResult.collectAsState()
     val analysisState by viewModel.analysisState.collectAsState()
     val context = LocalContext.current
 
@@ -126,6 +127,8 @@ fun VideoScreen(viewModel: MainViewModel) {
                 DisplayMode.FEATURE_MATCHES, DisplayMode.STABILIZED,
                 DisplayMode.DIFF_BEFORE, DisplayMode.DIFF_AFTER -> latestStabResult?.debugBitmap
                 DisplayMode.FOREGROUND_MASK -> latestFgResult?.maskBitmap
+                DisplayMode.CLEANED_MASK -> latestCandidateResult?.cleanedMaskBitmap
+                DisplayMode.CANDIDATE_REGIONS -> latestCandidateResult?.candidateOverlayBitmap
                 else -> null
             }
             // videoRotationDegrees (from METADATA_KEY_VIDEO_ROTATION) is carried through as

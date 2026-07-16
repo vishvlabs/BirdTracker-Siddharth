@@ -11,10 +11,13 @@ import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.example.vishv.cv.CandidateRegionExtractor
 import com.example.vishv.cv.FastFeatureProcessor
 import com.example.vishv.cv.GmmForegroundProcessor
 import com.example.vishv.cv.StabilizationProcessor
 import com.example.vishv.model.AnalysisFrame
+import com.example.vishv.model.CandidateExtractionResult
+import com.example.vishv.model.CleanupSettings
 import com.example.vishv.model.FastSettings
 import com.example.vishv.model.FeatureDetectionResult
 import com.example.vishv.model.ForegroundDetectionResult
@@ -47,6 +50,8 @@ enum class DisplayMode {
     DIFF_BEFORE,
     DIFF_AFTER,
     FOREGROUND_MASK,
+    CLEANED_MASK,
+    CANDIDATE_REGIONS,
 }
 
 data class CameraUiState(
@@ -93,6 +98,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val fastProcessor = FastFeatureProcessor()
     private val stabProcessor = StabilizationProcessor()
     private val gmmProcessor = GmmForegroundProcessor()
+    private val candidateExtractor = CandidateRegionExtractor()
 
     // --- Input mode ---
     private val _inputMode = MutableStateFlow(InputMode.CAMERA)
@@ -122,6 +128,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _gmmSettings = MutableStateFlow(GmmSettings())
     val gmmSettings: StateFlow<GmmSettings> = _gmmSettings.asStateFlow()
 
+    // --- Cleanup / candidate-extraction settings ---
+    private val _cleanupSettings = MutableStateFlow(CleanupSettings())
+    val cleanupSettings: StateFlow<CleanupSettings> = _cleanupSettings.asStateFlow()
+
     // --- Display mode (controls which debug bitmap is rendered) ---
     private val _displayMode = MutableStateFlow(DisplayMode.ORIGINAL)
     val displayMode: StateFlow<DisplayMode> = _displayMode.asStateFlow()
@@ -137,6 +147,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // --- Latest foreground detection result ---
     private val _latestFgResult = MutableStateFlow<ForegroundDetectionResult?>(null)
     val latestFgResult: StateFlow<ForegroundDetectionResult?> = _latestFgResult.asStateFlow()
+
+    // --- Latest candidate extraction result ---
+    private val _latestCandidateResult = MutableStateFlow<CandidateExtractionResult?>(null)
+    val latestCandidateResult: StateFlow<CandidateExtractionResult?> = _latestCandidateResult.asStateFlow()
+
+    // --- Session candidate region count (never resets — distinguishes total from per-frame) ---
+    private val _sessionCandidateRegionCount = MutableStateFlow(0L)
+    val sessionCandidateRegionCount: StateFlow<Long> = _sessionCandidateRegionCount.asStateFlow()
 
     // --- Video frame extraction diagnostic ---
     private val _videoExtractionDiag = MutableStateFlow<VideoExtractionDiag?>(null)
@@ -356,6 +374,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         gmmProcessor.updateSettings(newSettings)
     }
 
+    // --- Cleanup settings ---
+
+    fun toggleCleanupIncludeShadows() {
+        val s = _cleanupSettings.value.copy(includeShadows = !_cleanupSettings.value.includeShadows)
+        _cleanupSettings.value = s; candidateExtractor.updateSettings(s)
+    }
+
+    fun setCleanupMorphKernelSize(size: Int) {
+        val clamped = size.coerceIn(3, 15).let { if (it % 2 == 0) it + 1 else it }
+        val s = _cleanupSettings.value.copy(morphKernelSize = clamped)
+        _cleanupSettings.value = s; candidateExtractor.updateSettings(s)
+    }
+
+    fun setCleanupOpeningIterations(n: Int) {
+        val s = _cleanupSettings.value.copy(openingIterations = n.coerceIn(0, 5))
+        _cleanupSettings.value = s; candidateExtractor.updateSettings(s)
+    }
+
+    fun setCleanupClosingIterations(n: Int) {
+        val s = _cleanupSettings.value.copy(closingIterations = n.coerceIn(0, 5))
+        _cleanupSettings.value = s; candidateExtractor.updateSettings(s)
+    }
+
+    fun setCleanupMinContourArea(area: Int) {
+        val s = _cleanupSettings.value.copy(minContourArea = area.coerceIn(10, 2000))
+        _cleanupSettings.value = s; candidateExtractor.updateSettings(s)
+    }
+
+    fun setCleanupMaxForegroundCoveragePct(pct: Float) {
+        val s = _cleanupSettings.value.copy(maxForegroundCoveragePct = pct.coerceIn(0.1f, 0.9f))
+        _cleanupSettings.value = s; candidateExtractor.updateSettings(s)
+    }
+
     // --- Shared frame consumer ---
 
     /**
@@ -409,6 +460,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         } else null
 
+        val candidateResult: CandidateExtractionResult? = if (opencvReady && fgResult != null) {
+            try {
+                candidateExtractor.process(fgResult, mode)
+            } catch (e: Exception) {
+                null
+            }
+        } else null
+
         val processingTimeMs = SystemClock.elapsedRealtime() - receivedAtMs
 
         _analysisState.update { state ->
@@ -430,6 +489,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (fastResult != null) _latestDetectionResult.value = fastResult
         if (stabResult != null) _latestStabResult.value = stabResult
         if (fgResult != null) _latestFgResult.value = fgResult
+        if (candidateResult != null) {
+            _latestCandidateResult.value = candidateResult
+            if (candidateResult.acceptedCount > 0) {
+                _sessionCandidateRegionCount.update { it + candidateResult.acceptedCount }
+            }
+        }
 
         frame.bitmap.recycle()
     }
@@ -549,6 +614,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _latestDetectionResult.value = null
         _latestStabResult.value = null
         _latestFgResult.value = null
+        _latestCandidateResult.value = null
+        // _sessionCandidateRegionCount is intentionally never reset.
     }
 
     private fun releaseRetriever() {

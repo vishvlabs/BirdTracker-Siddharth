@@ -46,6 +46,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.example.vishv.model.CandidateExtractionResult
+import com.example.vishv.model.CandidateStatus
+import com.example.vishv.model.CleanupSettings
 import com.example.vishv.model.FastSettings
 import com.example.vishv.model.FeatureDetectionResult
 import com.example.vishv.model.ForegroundDetectionResult
@@ -79,9 +82,12 @@ fun MainScreen(viewModel: MainViewModel) {
     val displayMode     by viewModel.displayMode.collectAsState()
     val latestDetection by viewModel.latestDetectionResult.collectAsState()
     val latestStabResult by viewModel.latestStabResult.collectAsState()
-    val latestFgResult  by viewModel.latestFgResult.collectAsState()
-    val gmmSettings     by viewModel.gmmSettings.collectAsState()
-    val videoDiag       by viewModel.videoExtractionDiag.collectAsState()
+    val latestFgResult       by viewModel.latestFgResult.collectAsState()
+    val latestCandidateResult by viewModel.latestCandidateResult.collectAsState()
+    val gmmSettings          by viewModel.gmmSettings.collectAsState()
+    val cleanupSettings      by viewModel.cleanupSettings.collectAsState()
+    val sessionCandidateCount by viewModel.sessionCandidateRegionCount.collectAsState()
+    val videoDiag            by viewModel.videoExtractionDiag.collectAsState()
 
     val hasCameraPermission = ContextCompat.checkSelfPermission(
         context, Manifest.permission.CAMERA
@@ -101,6 +107,7 @@ fun MainScreen(viewModel: MainViewModel) {
         cameraRunning = cameraUiState.isRunning,
         videoUiState = videoUiState,
         fgResult = latestFgResult,
+        candidateResult = latestCandidateResult,
     )
 
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -161,6 +168,8 @@ fun MainScreen(viewModel: MainViewModel) {
                     detection = latestDetection,
                     stabResult = latestStabResult,
                     fgResult = latestFgResult,
+                    candidateResult = latestCandidateResult,
+                    sessionCandidateCount = sessionCandidateCount,
                 )
 
                 HorizontalDivider()
@@ -170,9 +179,11 @@ fun MainScreen(viewModel: MainViewModel) {
                     fastSettings = fastSettings,
                     stabSettings = stabSettings,
                     gmmSettings = gmmSettings,
+                    cleanupSettings = cleanupSettings,
                     detection = latestDetection,
                     stabResult = latestStabResult,
                     fgResult = latestFgResult,
+                    candidateResult = latestCandidateResult,
                     videoDiag = videoDiag,
                     onThresholdChange = viewModel::setFastThreshold,
                     onNmsToggle = viewModel::toggleNonMaxSuppression,
@@ -184,6 +195,12 @@ fun MainScreen(viewModel: MainViewModel) {
                     onGmmLearningRateChange = viewModel::setGmmLearningRate,
                     onGmmShadowToggle = viewModel::toggleGmmShadowDetection,
                     onGmmWarmUpFramesChange = viewModel::setGmmWarmUpFrames,
+                    onCleanupIncludeShadowsToggle = viewModel::toggleCleanupIncludeShadows,
+                    onCleanupMorphKernelSizeChange = viewModel::setCleanupMorphKernelSize,
+                    onCleanupOpeningIterationsChange = viewModel::setCleanupOpeningIterations,
+                    onCleanupClosingIterationsChange = viewModel::setCleanupClosingIterations,
+                    onCleanupMinContourAreaChange = viewModel::setCleanupMinContourArea,
+                    onCleanupMaxFgCoveragePctChange = viewModel::setCleanupMaxForegroundCoveragePct,
                 )
             }
         }
@@ -199,16 +216,22 @@ private fun deriveStatus(
     cameraRunning: Boolean,
     videoUiState: VideoUiState,
     fgResult: ForegroundDetectionResult?,
+    candidateResult: CandidateExtractionResult?,
 ): String = when {
     !opencvReady -> "OpenCV Failed"
     inputMode == InputMode.CAMERA && !hasCameraPermission -> "Camera Permission Required"
     inputMode == InputMode.CAMERA && !cameraRunning -> "Camera Stopped"
     inputMode == InputMode.CAMERA ->
-        if (fgResult?.modelStatus == GmmModelStatus.WARMING_UP) "Learning Background" else "Analyzing"
+        when {
+            fgResult?.modelStatus == GmmModelStatus.WARMING_UP -> "Learning Background"
+            candidateResult?.isGlobalChange == true -> "Global Scene Change"
+            else -> "Analyzing"
+        }
     videoUiState.uri == null -> "No Video Selected"
     !videoUiState.isPrepared -> "Loading..."
     !videoUiState.isPlaying -> "Paused"
     fgResult?.modelStatus == GmmModelStatus.WARMING_UP -> "Learning Background"
+    candidateResult?.isGlobalChange == true -> "Global Scene Change"
     else -> "Analyzing"
 }
 
@@ -221,7 +244,7 @@ private fun StatusStrip(
     analysisRateFps: Int,
     sessionElapsedSec: Long,
 ) {
-    val isAnalyzing = status == "Analyzing" || status == "Learning Background"
+    val isAnalyzing = status == "Analyzing" || status == "Learning Background" || status == "Global Scene Change"
     val isError = status == "OpenCV Failed" || status == "Camera Permission Required"
 
     val statusColor = when {
@@ -316,6 +339,14 @@ private val MODE_INFO = mapOf(
         chipLabel = "Foreground Mask",
         explanation = "GMM background model output. White = foreground (moving or novel objects), gray = shadow (if shadow detection is on), black = learned background.",
     ),
+    DisplayMode.CLEANED_MASK to ModeInfo(
+        chipLabel = "Cleaned Mask",
+        explanation = "Foreground mask after binary thresholding and morphological opening/closing. Noise and small blobs are removed; gaps inside regions are filled.",
+    ),
+    DisplayMode.CANDIDATE_REGIONS to ModeInfo(
+        chipLabel = "Candidates",
+        explanation = "Green boxes overlaid on the live feed mark each accepted candidate region. Regions that fail the size or fill-ratio filter are not drawn.",
+    ),
 )
 
 @Composable
@@ -389,26 +420,34 @@ private fun ObservedEntitiesPanel(
     detection: FeatureDetectionResult?,
     stabResult: StabilizationResult?,
     fgResult: ForegroundDetectionResult?,
+    candidateResult: CandidateExtractionResult?,
+    sessionCandidateCount: Long,
 ) {
     val stabLabel = stabResult?.let { stabStatusLabel(it.failureReason) }
     val stabColor: Color? = stabResult?.let { stabStatusColor(it.failureReason) }
 
-    val fgPixelValue = when {
+    val fgCoverageValue = when {
+        candidateResult != null && candidateResult.cleanedForegroundPixels > 0 ->
+            "${"%.1f".format(candidateResult.cleanedForegroundPct)}% cleaned"
         fgResult == null -> "–"
         fgResult.modelStatus == GmmModelStatus.WARMING_UP -> "Learning..."
         !fgResult.gmmApplied -> "–"
-        else -> "${fgResult.foregroundPixelCount} (${"%.1f".format(fgResult.foregroundPct)}%)"
+        else -> "${"%.1f".format(fgResult.foregroundPct)}% raw"
     }
 
-    val bgModelValue = when {
-        fgResult == null -> "–"
-        fgResult.modelStatus == GmmModelStatus.WARMING_UP ->
-            "${fgResult.warmUpFramesCompleted} / ${fgResult.warmUpFramesRequired}"
-        else -> "Active"
+    val candidateStatusValue = when (candidateResult?.candidateStatus) {
+        null -> "–"
+        CandidateStatus.WARMING_UP -> "Learning..."
+        CandidateStatus.GLOBAL_CHANGE -> "Scene Change"
+        CandidateStatus.STABILIZATION_UNAVAILABLE -> "No Stab"
+        CandidateStatus.DUPLICATE_FRAME -> "Duplicate"
+        CandidateStatus.NO_MOTION -> "No Motion"
+        CandidateStatus.ACTIVE -> "Active"
+        CandidateStatus.SKIPPED -> "–"
     }
-    val bgModelColor: Color? = when {
-        fgResult == null -> null
-        fgResult.modelStatus == GmmModelStatus.ACTIVE -> MaterialTheme.colorScheme.primary
+    val candidateStatusColor: Color? = when (candidateResult?.candidateStatus) {
+        CandidateStatus.ACTIVE -> MaterialTheme.colorScheme.primary
+        CandidateStatus.GLOBAL_CHANGE -> MaterialTheme.colorScheme.error
         else -> null
     }
 
@@ -433,8 +472,24 @@ private fun ObservedEntitiesPanel(
             EntityTile("Stabilization", stabLabel ?: "–", valueColor = stabColor, modifier = Modifier.weight(1f))
         }
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            EntityTile("Foreground Pixels", fgPixelValue, modifier = Modifier.weight(1f))
-            EntityTile("Background Model", bgModelValue, valueColor = bgModelColor, modifier = Modifier.weight(1f))
+            EntityTile("Foreground Coverage", fgCoverageValue, modifier = Modifier.weight(1f))
+            EntityTile(
+                "Candidate Status", candidateStatusValue,
+                valueColor = candidateStatusColor, modifier = Modifier.weight(1f),
+            )
+        }
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            EntityTile(
+                "Current Regions",
+                candidateResult?.acceptedCount?.toString() ?: "–",
+                modifier = Modifier.weight(1f),
+            )
+            EntityTile(
+                "Session Regions",
+                sessionCandidateCount.toString(),
+                subtitle = "all sources, never resets",
+                modifier = Modifier.weight(1f),
+            )
         }
     }
 }
@@ -445,6 +500,7 @@ private fun EntityTile(
     value: String,
     modifier: Modifier = Modifier,
     valueColor: Color? = null,
+    subtitle: String? = null,
 ) {
     Surface(modifier = modifier, tonalElevation = 2.dp, shape = MaterialTheme.shapes.small) {
         Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
@@ -459,6 +515,13 @@ private fun EntityTile(
                 fontWeight = FontWeight.SemiBold,
                 color = valueColor ?: MaterialTheme.colorScheme.onSurface,
             )
+            if (subtitle != null) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -496,9 +559,11 @@ private fun AdvancedDebugSection(
     fastSettings: FastSettings,
     stabSettings: StabilizationSettings,
     gmmSettings: GmmSettings,
+    cleanupSettings: CleanupSettings,
     detection: FeatureDetectionResult?,
     stabResult: StabilizationResult?,
     fgResult: ForegroundDetectionResult?,
+    candidateResult: CandidateExtractionResult?,
     videoDiag: VideoExtractionDiag?,
     onThresholdChange: (Int) -> Unit,
     onNmsToggle: () -> Unit,
@@ -510,6 +575,12 @@ private fun AdvancedDebugSection(
     onGmmLearningRateChange: (Double) -> Unit,
     onGmmShadowToggle: () -> Unit,
     onGmmWarmUpFramesChange: (Int) -> Unit,
+    onCleanupIncludeShadowsToggle: () -> Unit,
+    onCleanupMorphKernelSizeChange: (Int) -> Unit,
+    onCleanupOpeningIterationsChange: (Int) -> Unit,
+    onCleanupClosingIterationsChange: (Int) -> Unit,
+    onCleanupMinContourAreaChange: (Int) -> Unit,
+    onCleanupMaxFgCoveragePctChange: (Float) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
 
@@ -647,6 +718,83 @@ private fun AdvancedDebugSection(
                         } else {
                             OutlinedButton(onClick = { onGmmWarmUpFramesChange(n) }, modifier = Modifier.weight(1f)) { Text("$n", style = MaterialTheme.typography.labelSmall) }
                         }
+                    }
+                }
+            }
+
+            // ── Morphology & region filtering controls ─────────────────────────
+            DebugGroup("Morphology & Region Filtering") {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Include Shadows", style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f))
+                    Switch(checked = cleanupSettings.includeShadows, onCheckedChange = { onCleanupIncludeShadowsToggle() })
+                }
+                Text("Morph Kernel Size", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(3, 5, 7, 9).forEach { n ->
+                        if (n == cleanupSettings.morphKernelSize) {
+                            Button(onClick = {}, modifier = Modifier.weight(1f)) { Text("$n", style = MaterialTheme.typography.labelSmall) }
+                        } else {
+                            OutlinedButton(onClick = { onCleanupMorphKernelSizeChange(n) }, modifier = Modifier.weight(1f)) { Text("$n", style = MaterialTheme.typography.labelSmall) }
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Opening: ${cleanupSettings.openingIterations}", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(110.dp))
+                    Slider(
+                        value = cleanupSettings.openingIterations.toFloat(),
+                        onValueChange = { onCleanupOpeningIterationsChange(it.roundToInt()) },
+                        valueRange = 0f..5f, steps = 4,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Closing: ${cleanupSettings.closingIterations}", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(110.dp))
+                    Slider(
+                        value = cleanupSettings.closingIterations.toFloat(),
+                        onValueChange = { onCleanupClosingIterationsChange(it.roundToInt()) },
+                        valueRange = 0f..5f, steps = 4,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Min Area: ${cleanupSettings.minContourArea}", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(110.dp))
+                    Slider(
+                        value = cleanupSettings.minContourArea.toFloat(),
+                        onValueChange = { onCleanupMinContourAreaChange(it.roundToInt()) },
+                        valueRange = 10f..2000f,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Max FG: ${"%.0f".format(cleanupSettings.maxForegroundCoveragePct * 100)}%", style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(110.dp))
+                    Slider(
+                        value = cleanupSettings.maxForegroundCoveragePct,
+                        onValueChange = { onCleanupMaxFgCoveragePctChange(it) },
+                        valueRange = 0.1f..0.9f,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+
+            // ── Candidate stats ────────────────────────────────────────────────
+            if (candidateResult != null) {
+                DebugGroup("Candidate Stats") {
+                    DebugRow("Status", candidateResult.candidateStatus.name)
+                    if (candidateResult.isGlobalChange) DebugRow("Global Change", "Yes")
+                    DebugRow("Raw FG",  "${"%.1f".format(candidateResult.rawForegroundPct)}% (${candidateResult.rawForegroundPixels} px)")
+                    if (candidateResult.cleanedForegroundPixels > 0) {
+                        DebugRow("Cleaned FG", "${"%.1f".format(candidateResult.cleanedForegroundPct)}% (${candidateResult.cleanedForegroundPixels} px)")
+                    }
+                    DebugRow("Raw Contours", "${candidateResult.rawContourCount}")
+                    DebugRow("Accepted", "${candidateResult.acceptedCount}")
+                    DebugRow("Rejected (small)", "${candidateResult.rejectedSmallCount}")
+                    DebugRow("Rejected (large)", "${candidateResult.rejectedLargeCount}")
+                    DebugRow("Rejected (shape)", "${candidateResult.rejectedShapeCount}")
+                    DebugRow("Morphology Time", "${candidateResult.morphologyTimeMs} ms")
+                    DebugRow("Contour Time",    "${candidateResult.contourTimeMs} ms")
+                    DebugRow("Total Time",      "${candidateResult.totalTimeMs} ms")
+                    if (candidateResult.skipReason != null) {
+                        DebugRow("Skip Reason", candidateResult.skipReason)
                     }
                 }
             }

@@ -122,17 +122,16 @@ class GmmForegroundProcessor {
         val modelStatus = if (state.warmUpFramesCompleted < settings.warmUpFrames)
             GmmModelStatus.WARMING_UP else GmmModelStatus.ACTIVE
 
-        // Build mask bitmap only when the user has selected FOREGROUND_MASK mode.
-        val maskBitmap: Bitmap? = if (displayMode == DisplayMode.FOREGROUND_MASK) {
-            val rgbaOut = Mat()
-            Imgproc.cvtColor(fgMask, rgbaOut, Imgproc.COLOR_GRAY2RGBA)
-            val bmp = Bitmap.createBitmap(rgbaOut.cols(), rgbaOut.rows(), Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(rgbaOut, bmp)
-            rgbaOut.release()
-            bmp
-        } else null
-
+        // Always produce rawMaskBitmap so CandidateRegionExtractor can consume it downstream.
+        val rgbaOut = Mat()
+        Imgproc.cvtColor(fgMask, rgbaOut, Imgproc.COLOR_GRAY2RGBA)
+        val rawMaskBitmap = Bitmap.createBitmap(rgbaOut.cols(), rgbaOut.rows(), Bitmap.Config.ARGB_8888)
+        Utils.matToBitmap(rgbaOut, rawMaskBitmap)
+        rgbaOut.release()
         fgMask.release()
+
+        // maskBitmap reuses rawMaskBitmap for the FOREGROUND_MASK display mode — no second conversion.
+        val maskBitmap: Bitmap? = if (displayMode == DisplayMode.FOREGROUND_MASK) rawMaskBitmap else null
 
         val fgPct = if (totalPixels > 0) fgCount.toFloat() / totalPixels * 100f else 0f
         val shadowPct = if (totalPixels > 0) shadowCount.toFloat() / totalPixels * 100f else 0f
@@ -154,6 +153,7 @@ class GmmForegroundProcessor {
             shadowDetectionEnabled = settings.detectShadows,
             gmmProcessingTimeMs = gmmTimeMs,
             maskBitmap = maskBitmap,
+            rawMaskBitmap = rawMaskBitmap,
         )
     }
 
@@ -184,6 +184,7 @@ class GmmForegroundProcessor {
             shadowDetectionEnabled = settings.detectShadows,
             gmmProcessingTimeMs = SystemClock.elapsedRealtime() - totalStart,
             maskBitmap = null,
+            rawMaskBitmap = null,
         )
     }
 
